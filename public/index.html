@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ExpiryMitra Practice</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>ExpiryMitra</h1>
+    <p>Practice Build</p>
+  </header>
+
+  <main>
+    <section id="home" class="screen active">
+      <h2>Expiry Tracker</h2>
+      <p>Practice the complete scan pipeline.</p>
+      <button id="startButton">Start Scanning</button>
+      <button id="inventoryButton" class="secondary">View Inventory</button>
+    </section>
+
+    <section id="scan" class="screen">
+      <h2>Scan Product</h2>
+
+      <div class="camera-wrap">
+        <video id="video" autoplay muted playsinline></video>
+        <div class="scan-box"></div>
+      </div>
+
+      <p id="scanStatus">Starting camera...</p>
+      <p><strong>Barcode:</strong> <span id="barcodeValue">Not detected</span></p>
+
+      <button id="retryCamera" class="secondary">Retry Camera</button>
+      <button id="captureExpiry" disabled>Capture Expiry Image</button>
+
+      <canvas id="canvas" hidden></canvas>
+
+      <div id="expiryPreviewWrap" class="hidden">
+        <h3>Captured Expiry Image</h3>
+        <img id="expiryPreview" alt="Captured expiry area" />
+        <button id="sendScan">Send Scan to Backend</button>
+      </div>
+
+      <button id="homeFromScan" class="link-button">Back</button>
+    </section>
+
+    <section id="result" class="screen">
+      <h2>Scan Result</h2>
+      <div id="resultContent"></div>
+      <button id="confirmSave">Confirm & Save</button>
+      <button id="retryScan" class="secondary">Retry</button>
+      <button id="manualEntry" class="secondary">Manual Entry</button>
+      <button id="homeFromResult" class="link-button">Home</button>
+    </section>
+
+    <section id="manual" class="screen">
+      <h2>Manual Entry</h2>
+      <label>Barcode <input id="manualBarcode" /></label>
+      <label>Product name <input id="manualProduct" /></label>
+      <label>Expiry date <input id="manualExpiry" type="date" /></label>
+      <label>Batch <input id="manualBatch" /></label>
+      <label>Quantity <input id="manualQuantity" type="number" value="1" min="1" /></label>
+      <button id="saveManual">Save Manually</button>
+      <button id="homeFromManual" class="link-button">Back</button>
+    </section>
+
+    <section id="inventory" class="screen">
+      <h2>Inventory</h2>
+      <div id="inventoryList">Loading...</div>
+      <button id="refreshInventory" class="secondary">Refresh</button>
+      <button id="homeFromInventory" class="link-button">Home</button>
+    </section>
+  </main>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
