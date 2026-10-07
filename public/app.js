@@ -1,5 +1,4 @@
 import { BrowserMultiFormatReader } from "https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/+esm";
-
 const $ = (id) => document.getElementById(id);
 
 const screens = ["home", "scan", "result", "manual", "inventory"];
@@ -7,6 +6,11 @@ const screens = ["home", "scan", "result", "manual", "inventory"];
 let reader = null;
 let stream = null;
 let controls = null;
+let scanLoopTimer = null;
+let scanLoopActive = false;
+let scanCanvas = null;
+let scanContext = null;
+let scanBusy = false;
 let barcode = "";
 let expiryImage = "";
 let lastResult = null;
@@ -18,13 +22,26 @@ function show(name) {
 }
 
 function stopCamera() {
+  scanLoopActive = false;
+
+  if (scanLoopTimer) {
+    clearTimeout(scanLoopTimer);
+    scanLoopTimer = null;
+  }
+
+  scanBusy = false;
+
   if (controls) {
-    try { controls.stop(); } catch (_) {}
+    try {
+      controls.stop();
+    } catch (_) {}
     controls = null;
   }
 
   if (reader) {
-    try { reader.reset(); } catch (_) {}
+    try {
+      reader.reset();
+    } catch (_) {}
   }
 
   if (stream) {
@@ -33,6 +50,99 @@ function stopCamera() {
   }
 
   $("video").srcObject = null;
+}
+
+async function scanProcessedFrame() {
+  if (!scanLoopActive) return;
+
+  const video = $("video");
+
+  if (
+    !video.videoWidth ||
+    !video.videoHeight ||
+    !scanCanvas ||
+    !scanContext ||
+    !reader
+  ) {
+    scanLoopTimer = setTimeout(scanProcessedFrame, 120);
+    return;
+  }
+
+  if (scanBusy) {
+    scanLoopTimer = setTimeout(scanProcessedFrame, 120);
+    return;
+  }
+
+  scanBusy = true;
+
+  try {
+    const videoWidth = video.videoWidth;
+    const videoHeight = video.videoHeight;
+
+    // Large central ROI so small/curved barcodes are less likely to be cropped out.
+    const cropWidth = videoWidth * 0.8;
+    const cropHeight = videoHeight * 0.6;
+
+    const cropX = (videoWidth - cropWidth) / 2;
+    const cropY = (videoHeight - cropHeight) / 2;
+
+    // 2x upscale before decoding.
+    const outputWidth = Math.round(cropWidth * 2);
+    const outputHeight = Math.round(cropHeight * 2);
+
+    if (
+      scanCanvas.width !== outputWidth ||
+      scanCanvas.height !== outputHeight
+    ) {
+      scanCanvas.width = outputWidth;
+      scanCanvas.height = outputHeight;
+    }
+
+    scanContext.clearRect(0, 0, scanCanvas.width, scanCanvas.height);
+
+    scanContext.drawImage(
+      video,
+      cropX,
+      cropY,
+      cropWidth,
+      cropHeight,
+      0,
+      0,
+      outputWidth,
+      outputHeight,
+    );
+
+    try {
+      const result = reader.decodeFromCanvas(scanCanvas);
+
+      if (result) {
+        barcode = result.getText();
+        $("barcodeValue").textContent = barcode;
+        $("scanStatus").textContent =
+          "Barcode detected. Rotate the package and capture the expiry area.";
+        $("captureExpiry").disabled = false;
+
+        scanLoopActive = false;
+
+        if (scanLoopTimer) {
+          clearTimeout(scanLoopTimer);
+          scanLoopTimer = null;
+        }
+
+        return;
+      }
+    } catch (_) {
+      // Normal when the current frame has no decodable barcode.
+    }
+  } catch (error) {
+    console.error("Processed frame error:", error);
+  } finally {
+    scanBusy = false;
+  }
+
+  if (scanLoopActive) {
+    scanLoopTimer = setTimeout(scanProcessedFrame, 100);
+  }
 }
 
 async function startCamera() {
@@ -45,9 +155,31 @@ async function startCamera() {
 
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: "environment" } },
-      audio: false
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      },
+      audio: false,
     });
+    const track = stream.getVideoTracks()[0];
+    const settings = track.getSettings();
+
+    $("scanStatus").textContent =
+      `Camera: ${settings.width}×${settings.height} | ` +
+      `FPS: ${settings.frameRate || "?"} | ` +
+      `Facing: ${settings.facingMode || "?"}`;
+    try {
+      await track.applyConstraints({
+        advanced: [
+          {
+            focusMode: "continuous",
+          },
+        ],
+      });
+    } catch (error) {
+      console.log("Continuous autofocus not supported:", error);
+    }
 
     $("video").srcObject = stream;
     await $("video").play();
@@ -56,22 +188,16 @@ async function startCamera() {
 
     reader = new BrowserMultiFormatReader();
 
-    controls = await reader.decodeFromVideoElement(
-      $("video"),
-      (result, error) => {
-        if (!result) return;
+    scanCanvas = document.createElement("canvas");
+    scanContext = scanCanvas.getContext("2d", {
+      willReadFrequently: true,
+    });
 
-        barcode = result.getText();
-        $("barcodeValue").textContent = barcode;
-        $("scanStatus").textContent = "Barcode detected. Rotate the package and capture the expiry area.";
-        $("captureExpiry").disabled = false;
+    scanLoopActive = true;
+    scanLoopTimer = null;
+    scanBusy = false;
 
-        if (controls) {
-          controls.stop();
-          controls = null;
-        }
-      }
-    );
+    scanProcessedFrame();
   } catch (error) {
     console.error(error);
     $("scanStatus").textContent =
@@ -117,15 +243,16 @@ $("sendScan").addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         barcode,
-        image: expiryImage
-      })
+        image: expiryImage,
+      }),
     });
 
     lastResult = await response.json();
     renderResult(lastResult);
     show("result");
   } catch (error) {
-    $("scanStatus").textContent = "Backend request failed. Is the server running?";
+    $("scanStatus").textContent =
+      "Backend request failed. Is the server running?";
   } finally {
     $("sendScan").disabled = false;
   }
@@ -182,13 +309,13 @@ $("saveManual").addEventListener("click", async () => {
     product_name: $("manualProduct").value.trim(),
     expiry_date: $("manualExpiry").value,
     batch: $("manualBatch").value.trim(),
-    quantity: Number($("manualQuantity").value || 1)
+    quantity: Number($("manualQuantity").value || 1),
   };
 
   const response = await fetch("/api/inventory/manual", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
   });
 
   const result = await response.json();
@@ -211,7 +338,9 @@ async function loadInventory() {
     return;
   }
 
-  $("inventoryList").innerHTML = items.map((item) => `
+  $("inventoryList").innerHTML = items
+    .map(
+      (item) => `
     <div class="card ${escapeHtml(item.status)}">
       <h3>${escapeHtml(item.product_name)}</h3>
       <p>Barcode: ${escapeHtml(item.barcode)}</p>
@@ -220,7 +349,9 @@ async function loadInventory() {
       <p>Status: ${escapeHtml(item.status)}</p>
       <p>Source: ${escapeHtml(item.source)}</p>
     </div>
-  `).join("");
+  `,
+    )
+    .join("");
 }
 
 function escapeHtml(value) {
@@ -238,7 +369,7 @@ function escapeHtml(value) {
   ["homeFromScan", "home"],
   ["homeFromResult", "home"],
   ["homeFromManual", "home"],
-  ["homeFromInventory", "home"]
+  ["homeFromInventory", "home"],
 ].forEach(([id, screen]) => {
   $(id).addEventListener("click", async () => {
     stopCamera();
