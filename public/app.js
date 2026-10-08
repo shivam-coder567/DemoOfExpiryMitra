@@ -23,9 +23,13 @@ let scanBusy = false;
 let scanFrameCount = 0;
 
 // Adaptive scanner state.
+
 let fastMisses = 0;
+
 let fallbackLevel = 0;
+
 let lastDetectedBarcode = "";
+
 let lastDetectedAt = 0;
 
 let cropCanvas = null;
@@ -37,7 +41,12 @@ let smallCanvas = null;
 let smallContext = null;
 
 let rotateCanvas = null;
+
 let rotateContext = null;
+
+// Low-resolution canvas used to find likely barcode regions before decoding.
+let analysisCanvas = null;
+let analysisContext = null;
 
 let barcode = "";
 
@@ -65,8 +74,11 @@ function stopCamera() {
   scanFrameCount = 0;
 
   fastMisses = 0;
+
   fallbackLevel = 0;
+
   lastDetectedBarcode = "";
+
   lastDetectedAt = 0;
 
   if (controls) {
@@ -120,7 +132,6 @@ async function scanProcessedFrame() {
     if (!value) return false;
 
     barcode = String(value).trim();
-
     if (!barcode) return false;
 
     lastDetectedBarcode = barcode;
@@ -176,20 +187,185 @@ async function scanProcessedFrame() {
     }
   };
 
+  // Find regions that look "barcode dense" using cheap edge-density scoring.
+  // This is deliberately low-resolution and only runs after a few misses.
+  const findBarcodeCandidates = () => {
+    if (!analysisCanvas || !analysisContext) return [];
+
+    const aw = 320;
+    const ah = 180;
+    ensureSize(analysisCanvas, aw, ah);
+    drawFrame(
+      analysisContext,
+      video,
+      0,
+      0,
+      video.videoWidth,
+      video.videoHeight,
+      aw,
+      ah,
+      true,
+    );
+
+    const imageData = analysisContext.getImageData(0, 0, aw, ah).data;
+    const gray = new Uint8Array(aw * ah);
+
+    for (let y = 0; y < ah; y += 1) {
+      for (let x = 0; x < aw; x += 1) {
+        const i = (y * aw + x) * 4;
+        gray[y * aw + x] = Math.round(
+          0.299 * imageData[i] +
+            0.587 * imageData[i + 1] +
+            0.114 * imageData[i + 2],
+        );
+      }
+    }
+
+    // Overlapping windows cover the whole camera frame, unlike the old
+    // center-only crops. This is important for bottles whose barcode is low,
+    // high, left, or right in the frame.
+    const windows = [];
+    const addWindow = (x, y, w, h, kind) => {
+      const x0 = Math.max(0, Math.min(aw - w, Math.round(x)));
+      const y0 = Math.max(0, Math.min(ah - h, Math.round(y)));
+      windows.push({ x: x0, y: y0, w, h, kind });
+    };
+
+    // Medium tiles: good for small barcodes on bottles.
+    const tileW = 160;
+    const tileH = 70;
+    for (const y of [0, 55, 110]) {
+      for (const x of [0, 80, 160]) {
+        addWindow(x, y, tileW, tileH, "tile");
+      }
+    }
+
+    // Wide strips: useful when the barcode is long and low on a bottle.
+    for (const y of [0, 60, 120]) {
+      addWindow(0, y, 240, 54, "wide");
+    }
+
+    // Tall strips: useful for rotated/vertical barcode layouts.
+    for (const x of [0, 80, 160]) {
+      addWindow(x, 0, 80, 135, "tall");
+    }
+
+    const scored = windows.map((candidate) => {
+      let verticalEnergy = 0;
+      let horizontalEnergy = 0;
+      let transitions = 0;
+      let samples = 0;
+
+      // Sample every second pixel. A barcode creates many close black/white
+      // transitions, so edge density is a useful candidate signal.
+      for (let y = candidate.y + 2; y < candidate.y + candidate.h; y += 2) {
+        for (let x = candidate.x + 2; x < candidate.x + candidate.w; x += 2) {
+          const here = gray[y * aw + x];
+          const left = gray[y * aw + x - 2];
+          const up = gray[(y - 2) * aw + x];
+          const dx = Math.abs(here - left);
+          const dy = Math.abs(here - up);
+
+          verticalEnergy += dx;
+          horizontalEnergy += dy;
+          if (dx > 35 || dy > 35) transitions += 1;
+          samples += 1;
+        }
+      }
+
+      const vertical = verticalEnergy / Math.max(1, samples);
+      const horizontal = horizontalEnergy / Math.max(1, samples);
+      const transitionRate = transitions / Math.max(1, samples);
+
+      // Keep both orientations represented. Existing explicit rotation passes
+      // remain the final authority for 90/270/180 degree detection.
+      const score =
+        Math.max(vertical, horizontal) * 0.75 + transitionRate * 120;
+
+      return { ...candidate, score };
+    });
+
+    scored.sort((a, b) => b.score - a.score);
+
+    // Avoid repeatedly decoding almost identical regions.
+    const selected = [];
+    for (const candidate of scored) {
+      const tooSimilar = selected.some((other) => {
+        const cx = candidate.x + candidate.w / 2;
+        const cy = candidate.y + candidate.h / 2;
+        const ox = other.x + other.w / 2;
+        const oy = other.y + other.h / 2;
+        return Math.abs(cx - ox) < 45 && Math.abs(cy - oy) < 25;
+      });
+
+      if (!tooSimilar) selected.push(candidate);
+      if (selected.length >= 5) break;
+    }
+
+    return selected;
+  };
+
+  const decodeCandidate = (candidate, scale = 3.0) => {
+    const sx = (candidate.x / 320) * video.videoWidth;
+    const sy = (candidate.y / 180) * video.videoHeight;
+    const sw = (candidate.w / 320) * video.videoWidth;
+    const sh = (candidate.h / 180) * video.videoHeight;
+
+    const outputWidth = Math.round(sw * scale);
+    const outputHeight = Math.round(sh * scale);
+    ensureSize(cropCanvas, outputWidth, outputHeight);
+
+    drawFrame(
+      cropContext,
+      video,
+      sx,
+      sy,
+      sw,
+      sh,
+      outputWidth,
+      outputHeight,
+      true,
+    );
+
+    let detected = tryDecode(cropCanvas);
+    if (detected) return detected;
+
+    // One cheap preprocessing pass for low-contrast labels.
+    const imageData = cropContext.getImageData(
+      0,
+      0,
+      cropCanvas.width,
+      cropCanvas.height,
+    );
+    const pixels = imageData.data;
+
+    for (let i = 0; i < pixels.length; i += 4) {
+      const grayValue =
+        0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
+      const value = Math.max(0, Math.min(255, (grayValue - 128) * 1.45 + 128));
+      pixels[i] = value;
+      pixels[i + 1] = value;
+      pixels[i + 2] = value;
+    }
+
+    cropContext.putImageData(imageData, 0, 0);
+    detected = tryDecode(cropCanvas);
+    return detected;
+  };
+
   try {
     const videoWidth = video.videoWidth;
     const videoHeight = video.videoHeight;
 
     // ------------------------------------------------------------
     // FAST PATH: full frame, 1.5x.
-    // This runs every cycle and is intentionally cheap.
+    // Existing behavior is preserved.
     // ------------------------------------------------------------
     const fastScale = 1.5;
     const fastWidth = Math.round(videoWidth * fastScale);
     const fastHeight = Math.round(videoHeight * fastScale);
 
     ensureSize(scanCanvas, fastWidth, fastHeight);
-
     drawFrame(
       scanContext,
       video,
@@ -202,24 +378,18 @@ async function scanProcessedFrame() {
     );
 
     let detected = tryDecode(scanCanvas);
-
-    if (finishDetection(detected)) {
-      return;
-    }
+    if (finishDetection(detected)) return;
 
     fastMisses += 1;
 
     // ------------------------------------------------------------
-    // FAST SECOND CHANCE:
-    // A 2x full frame is used frequently, but not on every pass.
-    // This helps small barcodes without making normal scans slow.
+    // FAST SECOND CHANCE: full frame at 2x.
     // ------------------------------------------------------------
     if (fastMisses % 2 === 0) {
       const fullWidth = Math.round(videoWidth * 2);
       const fullHeight = Math.round(videoHeight * 2);
 
       ensureSize(scanCanvas, fullWidth, fullHeight);
-
       drawFrame(
         scanContext,
         video,
@@ -232,18 +402,30 @@ async function scanProcessedFrame() {
       );
 
       detected = tryDecode(scanCanvas);
+      if (finishDetection(detected)) return;
+    }
 
-      if (finishDetection(detected)) {
-        return;
+    // ------------------------------------------------------------
+    // NEW: barcode candidate localization.
+    // Every 2 misses, search the whole frame for dense barcode-like regions.
+    // This replaces the old assumption that the barcode must be centered.
+    // ------------------------------------------------------------
+    let localizedCandidates = [];
+
+    if (fastMisses >= 2 && fastMisses % 2 === 0) {
+      localizedCandidates = findBarcodeCandidates();
+
+      for (const candidate of localizedCandidates) {
+        detected = decodeCandidate(candidate, 3.0);
+        if (finishDetection(detected)) return;
       }
     }
 
     // ------------------------------------------------------------
-    // FALLBACK A:
-    // Center 70% crop at 2.5x.
-    // This catches small/curved barcodes near the center.
+    // LEGACY CENTER FALLBACK.
+    // Keep this because it is cheap and already worked for some products.
     // ------------------------------------------------------------
-    if (fastMisses >= 2) {
+    if (fastMisses >= 3) {
       const cropWidth = Math.round(videoWidth * 0.7);
       const cropHeight = Math.round(videoHeight * 0.7);
       const cropX = Math.round((videoWidth - cropWidth) / 2);
@@ -254,7 +436,6 @@ async function scanProcessedFrame() {
       const cropOutputHeight = Math.round(cropHeight * cropScale);
 
       ensureSize(cropCanvas, cropOutputWidth, cropOutputHeight);
-
       drawFrame(
         cropContext,
         video,
@@ -267,17 +448,13 @@ async function scanProcessedFrame() {
       );
 
       detected = tryDecode(cropCanvas);
-
-      if (finishDetection(detected)) {
-        return;
-      }
+      if (finishDetection(detected)) return;
     }
 
     // ------------------------------------------------------------
-    // FALLBACK B:
-    // Every 3rd miss, scan a tighter 45% crop at 3.5x.
+    // TIGHT CENTER FALLBACK.
     // ------------------------------------------------------------
-    if (fastMisses >= 3 && fastMisses % 3 === 0) {
+    if (fastMisses >= 4 && fastMisses % 3 === 0) {
       const smallWidth = Math.round(videoWidth * 0.45);
       const smallHeight = Math.round(videoHeight * 0.45);
       const smallX = Math.round((videoWidth - smallWidth) / 2);
@@ -288,7 +465,6 @@ async function scanProcessedFrame() {
       const outputHeight = Math.round(smallHeight * smallScale);
 
       ensureSize(smallCanvas, outputWidth, outputHeight);
-
       drawFrame(
         smallContext,
         video,
@@ -301,25 +477,17 @@ async function scanProcessedFrame() {
       );
 
       detected = tryDecode(smallCanvas);
-
-      if (finishDetection(detected)) {
-        return;
-      }
+      if (finishDetection(detected)) return;
     }
 
     // ------------------------------------------------------------
-    // ORIENTATION FALLBACK:
-    // Explicitly test 90°, 270° and 180°.
-    //
-    // This is intentionally NOT done on every scan.
-    // Normal horizontal barcodes stay on the fast path.
+    // ORIENTATION FALLBACK: preserve existing 90/270/180 behavior.
     // ------------------------------------------------------------
     if (fastMisses >= 4 && fastMisses % 4 === 0) {
       const baseWidth = Math.round(videoWidth * 1.5);
       const baseHeight = Math.round(videoHeight * 1.5);
 
       ensureSize(scanCanvas, baseWidth, baseHeight);
-
       drawFrame(
         scanContext,
         video,
@@ -336,21 +504,14 @@ async function scanProcessedFrame() {
       for (const angle of rotations) {
         const radians = (angle * Math.PI) / 180;
         const quarterTurn = angle === 90 || angle === 270;
-
         const outputWidth = quarterTurn ? baseHeight : baseWidth;
-
         const outputHeight = quarterTurn ? baseWidth : baseHeight;
 
         ensureSize(rotateCanvas, outputWidth, outputHeight);
-
         rotateContext.clearRect(0, 0, outputWidth, outputHeight);
-
         rotateContext.save();
-
         rotateContext.translate(outputWidth / 2, outputHeight / 2);
-
         rotateContext.rotate(radians);
-
         rotateContext.drawImage(
           scanCanvas,
           -baseWidth / 2,
@@ -358,63 +519,71 @@ async function scanProcessedFrame() {
           baseWidth,
           baseHeight,
         );
-
         rotateContext.restore();
 
         detected = tryDecode(rotateCanvas);
+        if (finishDetection(detected)) return;
+      }
 
-        if (finishDetection(detected)) {
-          return;
+      // If the barcode is tiny, rotating the entire 1920x1080 frame can still
+      // leave the bars too small. Reuse the best localized regions and rotate
+      // only those crops. This preserves the old 90/270/180 support while
+      // giving small rotated barcodes the same close-up treatment as normal ones.
+      for (const candidate of localizedCandidates.slice(0, 2)) {
+        const sx = (candidate.x / 320) * videoWidth;
+        const sy = (candidate.y / 180) * videoHeight;
+        const sw = (candidate.w / 320) * videoWidth;
+        const sh = (candidate.h / 180) * videoHeight;
+        const candidateScale = 2.75;
+        const candidateWidth = Math.round(sw * candidateScale);
+        const candidateHeight = Math.round(sh * candidateScale);
+
+        ensureSize(cropCanvas, candidateWidth, candidateHeight);
+        drawFrame(
+          cropContext,
+          video,
+          sx,
+          sy,
+          sw,
+          sh,
+          candidateWidth,
+          candidateHeight,
+        );
+
+        for (const angle of rotations) {
+          const radians = (angle * Math.PI) / 180;
+          const quarterTurn = angle === 90 || angle === 270;
+          const outputWidth = quarterTurn ? candidateHeight : candidateWidth;
+          const outputHeight = quarterTurn ? candidateWidth : candidateHeight;
+
+          ensureSize(rotateCanvas, outputWidth, outputHeight);
+          rotateContext.clearRect(0, 0, outputWidth, outputHeight);
+          rotateContext.save();
+          rotateContext.translate(outputWidth / 2, outputHeight / 2);
+          rotateContext.rotate(radians);
+          rotateContext.drawImage(
+            cropCanvas,
+            -candidateWidth / 2,
+            -candidateHeight / 2,
+            candidateWidth,
+            candidateHeight,
+          );
+          rotateContext.restore();
+
+          detected = tryDecode(rotateCanvas);
+          if (finishDetection(detected)) return;
         }
       }
     }
 
     // ------------------------------------------------------------
-    // CURVED / LOW-CONTRAST FALLBACK:
-    // Grayscale is expensive, so run it rarely.
+    // RECOVERY: keep the counter bounded.
     // ------------------------------------------------------------
-    if (fastMisses >= 6 && fastMisses % 6 === 0 && cropCanvas) {
-      const imageData = cropContext.getImageData(
-        0,
-        0,
-        cropCanvas.width,
-        cropCanvas.height,
-      );
-
-      const pixels = imageData.data;
-
-      for (let i = 0; i < pixels.length; i += 4) {
-        const gray =
-          0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
-
-        // Moderate contrast boost.
-        const value = Math.max(0, Math.min(255, (gray - 128) * 1.35 + 128));
-
-        pixels[i] = value;
-        pixels[i + 1] = value;
-        pixels[i + 2] = value;
-      }
-
-      cropContext.putImageData(imageData, 0, 0);
-
-      detected = tryDecode(cropCanvas);
-
-      if (finishDetection(detected)) {
-        return;
-      }
-    }
-
-    // ------------------------------------------------------------
-    // RECOVERY:
-    // Prevent an endlessly increasing miss counter.
-    // ------------------------------------------------------------
-    if (fastMisses >= 12) {
-      fastMisses = 2;
-    }
+    if (fastMisses >= 12) fastMisses = 2;
 
     if (fastMisses % 5 === 0) {
       $("scanStatus").textContent =
-        "Scanning... move closer or keep the barcode steady.";
+        "Scanning... move closer and keep the barcode steady.";
     }
   } catch (error) {
     console.error("Scanner error:", error);
@@ -423,8 +592,6 @@ async function scanProcessedFrame() {
   }
 
   if (scanLoopActive) {
-    // About 10 scan cycles/sec.
-    // Expensive fallback passes are gated above.
     scanLoopTimer = setTimeout(scanProcessedFrame, 100);
   }
 }
@@ -514,6 +681,12 @@ async function startCamera() {
       willReadFrequently: true,
     });
 
+    analysisCanvas = document.createElement("canvas");
+
+    analysisContext = analysisCanvas.getContext("2d", {
+      willReadFrequently: true,
+    });
+
     scanLoopActive = true;
 
     scanLoopTimer = null;
@@ -523,8 +696,11 @@ async function startCamera() {
     scanFrameCount = 0;
 
     fastMisses = 0;
+
     fallbackLevel = 0;
+
     lastDetectedBarcode = "";
+
     lastDetectedAt = 0;
 
     $("scanStatus").textContent =
@@ -612,85 +788,167 @@ function renderResult(data) {
   if (data.status === "confident") {
     container.innerHTML = `
 
+
+
       <div class="card safe">
 
+
+
         <h3>
+
           ${escapeHtml(data.product.name)}
+
         </h3>
 
 
 
+
+
+
+
         <p>
+
+
 
           <strong>Brand:</strong>
 
+
+
           ${escapeHtml(data.product.brand || "-")}
+
+
 
         </p>
 
 
 
+
+
+
+
         <p>
+
+
 
           <strong>Barcode:</strong>
 
+
+
           ${escapeHtml(data.product.barcode)}
+
+
 
         </p>
 
 
 
+
+
+
+
         <p>
+
+
 
           <strong>Expiry:</strong>
 
+
+
           ${escapeHtml(data.expiry.parsed_expiry_date)}
+
+
 
         </p>
 
 
 
+
+
+
+
         <p>
 
+
+
           <strong>
+
             Manufacturing:
+
           </strong>
+
+
 
           ${escapeHtml(data.expiry.parsed_mfg_date || "-")}
 
+
+
         </p>
 
 
 
+
+
+
+
         <p>
+
+
 
           <strong>Batch:</strong>
 
+
+
           ${escapeHtml(data.expiry.batch || "-")}
+
+
 
         </p>
 
 
 
+
+
+
+
         <p>
+
+
 
           <strong>Confidence:</strong>
 
+
+
           ${data.expiry.confidence}
 
+
+
         </p>
+
+
+
+
 
 
 
         <p>
 
+
+
           <strong>OCR:</strong>
+
+
 
           ${escapeHtml(data.expiry.raw_text)}
 
+
+
         </p>
 
+
+
       </div>
+
+
 
     `;
 
@@ -698,37 +956,67 @@ function renderResult(data) {
   } else {
     container.innerHTML = `
 
+
+
       <div class="card expiring_soon">
 
+
+
         <h3>
+
           ${escapeHtml(data.status)}
+
         </h3>
+
+
+
+
 
 
 
         <p>
 
+
+
           ${escapeHtml(data.message || "Please retry or enter manually.")}
 
+
+
         </p>
+
+
+
+
 
 
 
         ${
           data.expiry?.raw_text
             ? `
+
               <p>
+
+
 
                 <strong>OCR:</strong>
 
+
+
                 ${escapeHtml(data.expiry.raw_text)}
 
+
+
               </p>
+
             `
             : ""
         }
 
+
+
       </div>
+
+
 
     `;
 
@@ -808,69 +1096,135 @@ async function loadInventory() {
     .map(
       (item) => `
 
+
+
         <div
+
           class="card ${escapeHtml(item.status)}"
+
         >
+
+
 
           <h3>
 
+
+
             ${escapeHtml(item.product_name)}
+
+
 
           </h3>
 
 
 
+
+
+
+
           <p>
+
+
 
             Barcode:
 
+
+
             ${escapeHtml(item.barcode)}
+
+
 
           </p>
 
 
 
+
+
+
+
           <p>
+
+
 
             Expiry:
 
+
+
             ${escapeHtml(item.expiry_date)}
+
+
 
           </p>
 
 
 
+
+
+
+
           <p>
+
+
 
             Days left:
 
+
+
             ${item.days_left}
+
+
 
           </p>
 
 
 
+
+
+
+
           <p>
+
+
 
             Status:
 
+
+
             ${escapeHtml(item.status)}
 
+
+
           </p>
+
+
+
+
 
 
 
           <p>
 
+
+
             Source:
+
+
 
             ${escapeHtml(item.source)}
 
+
+
           </p>
+
+
+
+
 
 
 
         </div>
+
+
 
       `,
     )
